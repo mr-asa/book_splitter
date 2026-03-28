@@ -3,7 +3,6 @@ import argparse
 import os
 import subprocess
 import json
-import os
 
 # Suppress huggingface_hub symlink warnings on Windows
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
@@ -13,6 +12,58 @@ from openai import OpenAI
 
 GLOBAL_MODEL = None
 GLOBAL_DEBUG = False
+
+
+def check_dependencies(api_base):
+    """Check that all required external tools are available before starting work."""
+    errors = []
+
+    # --- Check ffmpeg ---
+    try:
+        kwargs = {}
+        if sys.platform == "win32":
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        result = subprocess.run(
+            ["ffmpeg", "-version"],
+            capture_output=True, text=True, **kwargs,
+        )
+        if result.returncode != 0:
+            errors.append("ffmpeg found but returned an error. Reinstall ffmpeg.")
+    except FileNotFoundError:
+        errors.append(
+            "ffmpeg not found!\n"
+            "  -> Install ffmpeg and add it to PATH,\n"
+            "     or place ffmpeg.exe next to this script."
+        )
+
+    # --- Check LM Studio API with a real completion call ---
+    try:
+        client = OpenAI(base_url=api_base, api_key="lm-studio")
+        response = client.chat.completions.create(
+            model="local-model",
+            messages=[{"role": "user", "content": "ping"}],
+            max_tokens=1,
+            temperature=0,
+        )
+        # If we get here, the API is reachable and a model is loaded
+    except Exception as e:
+        errors.append(
+            f"LM Studio API is not reachable ({api_base}):\n"
+            f"  {e}\n"
+            f"  -> Start LM Studio and load a model before running the script."
+        )
+
+    if errors:
+        print("\n" + "=" * 50)
+        print("ERROR: Not all dependencies are available!")
+        print("=" * 50)
+        for i, err in enumerate(errors, 1):
+            print(f"\n  {i}. {err}")
+        print("\n" + "=" * 50)
+        sys.exit(1)
+    else:
+        print("[OK] All dependencies verified.")
+
 
 def transcribe_audio(file_path, model_size="turbo", log_msg="downloading if not cached"):
     global GLOBAL_MODEL
@@ -54,19 +105,15 @@ def find_semantic_break(text_chunk, api_base="http://localhost:1234/v1", model_n
         f"Text:\n{text_chunk}\n\nSplit sentence:"
     )
     
-    try:
-        response = client.chat.completions.create(
-            model=model_name,
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.1,
-        )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        print(f"Error communicating with LM Studio: {e}")
-        return ""
+    response = client.chat.completions.create(
+        model=model_name,
+        messages=[
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.1,
+    )
+    return response.choices[0].message.content.strip()
 
 def split_audio_ffmpeg(input_file, start_t, end_t, output_file):
     print(f"Splitting: {start_t} to {end_t if end_t else 'end'} -> {output_file}")
@@ -81,7 +128,6 @@ def split_audio_ffmpeg(input_file, start_t, end_t, output_file):
             print(f"FFmpeg Error:\n{result.stderr}")
     except FileNotFoundError:
         print("\nERROR: 'ffmpeg' not found! Ensure FFmpeg is installed and added to the system PATH (or put ffmpeg.exe in the script folder).")
-        import sys
         sys.exit(1)
 
 def _main_logic():
@@ -94,13 +140,12 @@ def _main_logic():
     parser.add_argument("--whisper-model", default="turbo", help="Whisper Model name")
     parser.add_argument("--config", default="config.json", help="Path to config file")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    parser.add_argument("--transcription", default=None, help="Path to existing transcription JSON file (skip transcription step)")
     args = parser.parse_args()
     
     if not os.path.exists(args.config):
         print("\n=== FIRST RUN ===")
-        in_file = input("Enter the full path to the audio file (.mp3, .m4b, etc.): ").strip('"').strip("'")
         config = {
-            "input_file": in_file,
             "out_dir": "output",
             "target_mins": 7.0,
             "api_base": "http://localhost:1234/v1",
@@ -122,8 +167,6 @@ def _main_logic():
     
     with open(args.config, 'r', encoding='utf-8') as f:
         config = json.load(f)
-        if not args.input and "input_file" in config:
-            args.input = config["input_file"]
         if args.out_dir == "output" and "out_dir" in config:
             args.out_dir = config["out_dir"]
         if args.target_mins == 7.0 and "target_mins" in config:
@@ -143,32 +186,67 @@ def _main_logic():
         sys.stdout = Logger("execution_log.txt")
 
     if not args.input:
+        in_file = input("Enter the full path to the audio file (.mp3, .m4b, etc.): ").strip('"').strip("'")
+        args.input = in_file
+    
+    if not args.input:
         print("ERROR: File path not specified!")
         return
     
-    os.makedirs(args.out_dir, exist_ok=True)
-    
-    whisper_mod = getattr(args, 'whisper_model', 'turbo')
-    
-    whisper_log = "downloading if not cached"
-    if "whisper_models" in config:
-        for wm in config["whisper_models"]:
-            if wm.get("name") == whisper_mod:
-                whisper_log = wm.get("log", whisper_log)
-                break
-                
-    segments = transcribe_audio(args.input, whisper_mod, whisper_log)
-    if not segments:
-        print("No speech detected.")
-        return
-        
-    print(f"Total transcribed segments: {len(segments)}")
+    # --- Pre-flight dependency checks (before any heavy work) ---
+    check_dependencies(args.api_base)
     
     base_name = os.path.splitext(os.path.basename(args.input))[0]
+    
+    # Create a subfolder per audiobook: output/<filename>/
+    args.out_dir = os.path.join(args.out_dir, base_name)
+    os.makedirs(args.out_dir, exist_ok=True)
+    
+    # --- Resume / transcription logic ---
+    segments = None
     transcription_file = os.path.join(args.out_dir, f"STT_{base_name}.json")
-    with open(transcription_file, "w", encoding="utf-8") as f:
-        json.dump(segments, f, ensure_ascii=False, indent=4)
-    print(f"Transcription saved to {transcription_file}")
+    
+    if args.transcription:
+        # Explicit transcription file provided via --transcription
+        if not os.path.exists(args.transcription):
+            print(f"ERROR: Transcription file not found: {args.transcription}")
+            return
+        print(f"Loading existing transcription from {args.transcription}...")
+        with open(args.transcription, "r", encoding="utf-8") as f:
+            segments = json.load(f)
+        print(f"Loaded {len(segments)} segments.")
+    elif os.path.exists(transcription_file):
+        # Auto-detected existing transcription
+        print(f"\n>> Existing transcription found: {transcription_file}")
+        answer = input("Use it? (y/n, default y): ").strip().lower()
+        if answer in ("", "y", "yes"):
+            print(f"Loading transcription from {transcription_file}...")
+            with open(transcription_file, "r", encoding="utf-8") as f:
+                segments = json.load(f)
+            print(f"Loaded {len(segments)} segments.")
+    
+    if segments is None:
+        # Need to transcribe
+        whisper_mod = getattr(args, 'whisper_model', 'turbo')
+        whisper_log = "downloading if not cached"
+        if "whisper_models" in config:
+            for wm in config["whisper_models"]:
+                if wm.get("name") == whisper_mod:
+                    whisper_log = wm.get("log", whisper_log)
+                    break
+        
+        segments = transcribe_audio(args.input, whisper_mod, whisper_log)
+        if not segments:
+            print("No speech detected.")
+            return
+        
+        print(f"Total transcribed segments: {len(segments)}")
+        
+        with open(transcription_file, "w", encoding="utf-8") as f:
+            json.dump(segments, f, ensure_ascii=False, indent=4)
+        print(f"Transcription saved to {transcription_file}")
+    
+    print(f"\nTotal segments to process: {len(segments)}")
     
     target_sec = args.target_mins * 60.0
     
