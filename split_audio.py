@@ -3,6 +3,8 @@ import argparse
 import os
 import subprocess
 import json
+import re
+from difflib import SequenceMatcher
 
 # Suppress huggingface_hub symlink warnings on Windows
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
@@ -12,6 +14,270 @@ from openai import OpenAI
 
 GLOBAL_MODEL = None
 GLOBAL_DEBUG = False
+
+
+def _normalize_text(text):
+    return " ".join((text or "").split()).strip()
+
+
+def _enrich_pause_metadata(segments):
+    """Populate gap_before/gap_after using current segment boundaries."""
+    if not segments:
+        return segments
+
+    for i, seg in enumerate(segments):
+        if i == 0:
+            seg["gap_before"] = 0.0
+        else:
+            prev_end = float(segments[i - 1].get("end", 0.0))
+            cur_start = float(seg.get("start", 0.0))
+            seg["gap_before"] = max(0.0, cur_start - prev_end)
+
+    for i, seg in enumerate(segments):
+        if i == len(segments) - 1:
+            seg["gap_after"] = 0.0
+        else:
+            cur_end = float(seg.get("end", 0.0))
+            next_start = float(segments[i + 1].get("start", 0.0))
+            seg["gap_after"] = max(0.0, next_start - cur_end)
+
+    return segments
+
+
+def _strip_pause_markers(text):
+    return re.sub(r"\s*\[(?:Long)?Pause:[^\]]+\]", "", text or "").strip()
+
+
+def _tokenize_text(text):
+    return re.findall(r"[A-Za-zА-Яа-яЁё]+", (text or "").lower())
+
+
+def _is_heading_token(token):
+    if not token:
+        return False
+
+    keywords = ["глава", "часть", "chapter", "part", "chap"]
+    for kw in keywords:
+        if token == kw or token.startswith(kw):
+            return True
+        if SequenceMatcher(None, token, kw).ratio() >= 0.72:
+            return True
+    return False
+
+
+def _is_heading_marker_text(text):
+    """Heuristic guard: keep only markers that look like chapter/part headings."""
+    tokens = _tokenize_text(text)
+    if not tokens:
+        return False
+
+    # Heading token should appear at the beginning, allowing minor ASR typos.
+    first_tokens = tokens[:3]
+    return any(_is_heading_token(tok) for tok in first_tokens[:2])
+
+
+def _parse_yes_no(answer, default=True):
+    normalized = (answer or "").strip().lower()
+    if not normalized:
+        return default
+
+    yes_values = {"y", "yes", "д", "да", "+", "1", "true"}
+    no_values = {"n", "no", "н", "нет", "-", "0", "false"}
+
+    if normalized in yes_values:
+        return True
+    if normalized in no_values:
+        return False
+    return default
+
+
+def ask_yes_no(prompt, default=True):
+    answer = input(prompt)
+    return _parse_yes_no(answer, default=default)
+
+
+def _extract_marker_indexes(raw_text, min_idx, max_idx):
+    """Extract marker indexes from LLM response."""
+    raw = (raw_text or "").strip()
+    if not raw:
+        return []
+
+    candidate = raw
+    if "{" in raw and "}" in raw:
+        start = raw.find("{")
+        end = raw.rfind("}") + 1
+        candidate = raw[start:end]
+
+    parsed = None
+    try:
+        parsed = json.loads(candidate)
+    except Exception:
+        parsed = None
+
+    indexes = []
+    if isinstance(parsed, dict):
+        markers = parsed.get("markers", [])
+        if isinstance(markers, list):
+            for marker in markers:
+                if isinstance(marker, dict):
+                    idx = marker.get("index")
+                else:
+                    idx = marker
+                if isinstance(idx, int) and min_idx <= idx < max_idx:
+                    indexes.append(idx)
+    elif isinstance(parsed, list):
+        for item in parsed:
+            if isinstance(item, int) and min_idx <= item < max_idx:
+                indexes.append(item)
+
+    if indexes:
+        return sorted(set(indexes))
+
+    # Fallback for non-JSON replies.
+    for match in re.findall(r"(?<!\d)(\d{1,6})(?!\d)", raw):
+        idx = int(match)
+        if min_idx <= idx < max_idx:
+            indexes.append(idx)
+
+    return sorted(set(indexes))
+
+
+def find_structure_markers_with_llm(segments, api_base, model_name):
+    """Find probable chapter/part boundaries semantically via LLM."""
+    if not segments:
+        return []
+
+    client = OpenAI(base_url=api_base, api_key="lm-studio")
+    total = len(segments)
+    window_size = 220
+    overlap = 40
+    step = max(1, window_size - overlap)
+    marker_indexes = set()
+
+    for window_start in range(0, total, step):
+        window_end = min(total, window_start + window_size)
+        window_lines = []
+
+        for idx in range(window_start, window_end):
+            seg = segments[idx]
+            text = _normalize_text(seg.get("text", ""))
+            if not text:
+                continue
+
+            ts = float(seg.get("start", 0.0))
+            gap_before = float(seg.get("gap_before", 0.0))
+            window_lines.append(f"{idx}|{ts:.2f}|gap_before={gap_before:.2f}|{text[:180]}")
+
+        if not window_lines:
+            continue
+
+        prompt = (
+            "You analyze audiobook transcripts and detect ONLY starts of chapter/part headings. "
+            "A marker should be selected only for a chapter/part heading line (or its clear ASR-corrupted form). "
+            "Treat likely ASR misspellings and near-homophones as valid clues when context strongly supports a heading, "
+            "for example: 'клава пятая' should be interpreted as likely 'глава пятая', "
+            "'чясть вторая' as likely 'часть вторая', and 'глва шестая' as likely 'глава шестая'. "
+            "If a detected heading appears very early and would create the first chunk shorter than 90 seconds (typical title/music intro), do not mark it. "
+            "For chapter/part headings, place the marker on the heading line itself so split happens BEFORE the heading, not after the previous sentence. "
+            "Example: keep '... и они ушли. музыкальное интро ... <cut> Глава третья ...', "
+            "and avoid '... и они ушли. <cut> музыкальное интро ... Глава третья ...'. "
+            "A large gap_before value (for example >5s) usually means music/insert/pause before the next spoken line and is a strong structural clue. "
+            "Do not mark regular paragraph transitions.\n\n"
+            "Input format per line: index|start_seconds|gap_before=seconds|text\n"
+            "Return STRICT JSON ONLY in this format:\n"
+            "{\"markers\":[{\"index\":123,\"reason\":\"short reason\"}]}\n"
+            "If nothing is found, return exactly: {\"markers\":[]}\n\n"
+            f"Transcript lines:\n{chr(10).join(window_lines)}"
+        )
+
+        try:
+            response = client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": "You are a precise JSON-only assistant."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0,
+            )
+            content = response.choices[0].message.content or ""
+            indexes = _extract_marker_indexes(content, window_start, window_end)
+            marker_indexes.update(indexes)
+        except Exception as e:
+            print(f"LLM chapter detection warning for window {window_start}-{window_end}: {e}")
+
+    # Rule-based backup: keep explicit heading-like lines, especially after long pauses.
+    backup_indexes = set()
+    for idx, seg in enumerate(segments):
+        text = _normalize_text(seg.get("text", ""))
+        if not _is_heading_marker_text(text):
+            continue
+
+        gap_before = float(seg.get("gap_before", 0.0))
+        tokens = _tokenize_text(text)
+        explicit_heading_start = bool(tokens) and _is_heading_token(tokens[0]) and len(tokens) <= 14
+
+        if gap_before >= 5.0 or explicit_heading_start:
+            backup_indexes.add(idx)
+
+    if backup_indexes:
+        marker_indexes.update(backup_indexes)
+        print(f"Added {len(backup_indexes)} heading marker(s) from rule-based backup.")
+
+    markers = []
+    dropped_non_headings = 0
+    for idx in sorted(marker_indexes):
+        seg = segments[idx]
+        text = _normalize_text(seg.get("text", ""))
+        if not _is_heading_marker_text(text):
+            dropped_non_headings += 1
+            continue
+        markers.append({
+            "index": idx,
+            "start": float(seg.get("start", 0.0)),
+            "end": float(seg.get("end", 0.0)),
+            "text": text,
+        })
+
+    if dropped_non_headings:
+        print(f"Filtered out {dropped_non_headings} non-heading marker(s) from LLM output.")
+
+    # Keep one marker per very close timestamp region.
+    deduped = []
+    for marker in markers:
+        if not deduped:
+            deduped.append(marker)
+            continue
+
+        prev = deduped[-1]
+        if marker["start"] - prev["start"] < 30.0:
+            continue
+        deduped.append(marker)
+
+    return deduped
+
+
+def split_by_markers(input_file, out_dir, base_name, markers):
+    """Split audio using detected chapter/part boundaries."""
+    cut_points = sorted({m["start"] for m in markers if m["start"] > 0.5})
+
+    if cut_points and cut_points[0] < 90.0:
+        print(f"Skipping early first marker at {cut_points[0]:.2f}s (intro shorter than 90s).")
+        cut_points = cut_points[1:]
+
+    current_start_t = 0.0
+    part_idx = 1
+
+    for cut_time in cut_points:
+        if cut_time - current_start_t < 1.0:
+            continue
+
+        out_file = os.path.join(out_dir, f"{part_idx:03d}_{base_name}.mp3")
+        split_audio_ffmpeg(input_file, current_start_t, cut_time, out_file)
+        part_idx += 1
+        current_start_t = cut_time
+
+    out_file = os.path.join(out_dir, f"{part_idx:03d}_{base_name}.mp3")
+    split_audio_ffmpeg(input_file, current_start_t, None, out_file)
 
 
 def check_dependencies(api_base):
@@ -73,7 +339,46 @@ def transcribe_audio(file_path, model_size="turbo", log_msg="downloading if not 
         GLOBAL_MODEL = WhisperModel(model_size, device="auto", compute_type="default")
     
     print(f"Transcribing {file_path}...")
-    segments, info = GLOBAL_MODEL.transcribe(file_path, beam_size=5)
+
+    transcribe_attempts = [
+        {
+            "beam_size": 5,
+            "word_timestamps": True,
+            "vad_filter": True,
+            "vad_parameters": {
+                "min_silence_duration_ms": 500,
+                "speech_pad_ms": 200,
+            },
+        },
+        {
+            "beam_size": 5,
+            "word_timestamps": True,
+            "vad_filter": True,
+        },
+        {
+            "beam_size": 5,
+            "word_timestamps": True,
+        },
+        {
+            "beam_size": 5,
+        },
+    ]
+
+    segments = None
+    info = None
+    for attempt_idx, kwargs in enumerate(transcribe_attempts, 1):
+        try:
+            segments, info = GLOBAL_MODEL.transcribe(file_path, **kwargs)
+            if attempt_idx > 1:
+                print(f"[WARN] Fallback STT mode used: {kwargs}")
+            break
+        except TypeError as e:
+            if attempt_idx == len(transcribe_attempts):
+                raise
+            print(f"[WARN] STT options not supported ({e}), retrying with simpler options...")
+
+    if segments is None or info is None:
+        raise RuntimeError("Transcription failed: model returned no segments/info")
     
     print(f"Detected language '{info.language}' with probability {info.language_probability:.2f}")
     print("Recognizing speech (this may take a while depending on PC power)...")
@@ -81,17 +386,32 @@ def transcribe_audio(file_path, model_size="turbo", log_msg="downloading if not 
     total_mins = info.duration / 60.0
     results = []
     for segment in segments:
+        raw_start = float(segment.start)
+        raw_end = float(segment.end)
+
+        words = getattr(segment, "words", None) or []
+        word_starts = [float(w.start) for w in words if getattr(w, "start", None) is not None]
+        word_ends = [float(w.end) for w in words if getattr(w, "end", None) is not None]
+
+        speech_start = word_starts[0] if word_starts else raw_start
+        speech_end = word_ends[-1] if word_ends else raw_end
+
+        if speech_end < speech_start:
+            speech_start, speech_end = raw_start, raw_end
+
         results.append({
-            "start": segment.start,
-            "end": segment.end,
-            "text": segment.text.strip()
+            "start": speech_start,
+            "end": speech_end,
+            "raw_start": raw_start,
+            "raw_end": raw_end,
+            "text": segment.text.strip(),
         })
-        current_mins = segment.end / 60.0
+        current_mins = raw_end / 60.0
         percent = (current_mins / total_mins) * 100
         print(f"\rAudio transcribed: {current_mins:.2f} of {total_mins:.2f} mins ({percent:.1f}% done)...", end="", flush=True)
         
     print("\nTranscription complete!")
-    return results
+    return _enrich_pause_metadata(results)
 
 def find_semantic_break(text_chunk, api_base="http://localhost:1234/v1", model_name="local-model"):
     client = OpenAI(base_url=api_base, api_key="lm-studio")
@@ -113,7 +433,8 @@ def find_semantic_break(text_chunk, api_base="http://localhost:1234/v1", model_n
         ],
         temperature=0.1,
     )
-    return response.choices[0].message.content.strip()
+    content = response.choices[0].message.content or ""
+    return content.strip()
 
 def split_audio_ffmpeg(input_file, start_t, end_t, output_file):
     print(f"Splitting: {start_t} to {end_t if end_t else 'end'} -> {output_file}")
@@ -218,12 +539,15 @@ def _main_logic():
     elif os.path.exists(transcription_file):
         # Auto-detected existing transcription
         print(f"\n>> Existing transcription found: {transcription_file}")
-        answer = input("Use it? (y/n, default y): ").strip().lower()
-        if answer in ("", "y", "yes"):
+        use_existing_stt = ask_yes_no("Use it? (y/n or +/- , default y): ", default=True)
+        if use_existing_stt:
             print(f"Loading transcription from {transcription_file}...")
             with open(transcription_file, "r", encoding="utf-8") as f:
                 segments = json.load(f)
             print(f"Loaded {len(segments)} segments.")
+
+    if segments is not None:
+        segments = _enrich_pause_metadata(segments)
     
     if segments is None:
         # Need to transcribe
@@ -247,6 +571,25 @@ def _main_logic():
         print(f"Transcription saved to {transcription_file}")
     
     print(f"\nTotal segments to process: {len(segments)}")
+
+    print("\nChecking transcript for chapter/part boundaries via LLM...")
+    structure_markers = find_structure_markers_with_llm(segments, args.api_base, args.llm_model)
+    if structure_markers:
+        print(f"\nFound {len(structure_markers)} possible chapter/part markers.")
+        preview_count = min(5, len(structure_markers))
+        for marker in structure_markers[:preview_count]:
+            print(f"  - {marker['start']:.2f}s: {marker['text']}")
+        if len(structure_markers) > preview_count:
+            print(f"  ... and {len(structure_markers) - preview_count} more")
+
+        split_by_chapters = ask_yes_no("Split by detected chapters/parts? (y/n or +/- , default y): ", default=True)
+        if split_by_chapters:
+            print("Splitting by detected chapter/part markers...")
+            split_by_markers(args.input, args.out_dir, base_name, structure_markers)
+            print("Done!")
+            return
+
+        print("Continuing with semantic timing-based splitting...")
     
     target_sec = args.target_mins * 60.0
     
@@ -263,8 +606,14 @@ def _main_logic():
             
             context_text_parts = []
             for i, s in enumerate(context_segs):
-                pause = context_segs[i+1]["start"] - s["end"] if i < len(context_segs)-1 else 0.0
-                if pause > 0.5:
+                if i < len(context_segs) - 1:
+                    pause = float(s.get("gap_after", context_segs[i + 1]["start"] - s["end"]))
+                else:
+                    pause = 0.0
+
+                if pause >= 5.0:
+                    context_text_parts.append(f"{s['text']} [LongPause: {pause:.1f} sec]")
+                elif pause > 0.5:
                     context_text_parts.append(f"{s['text']} [Pause: {pause:.1f} sec]")
                 else:
                     context_text_parts.append(s['text'])
@@ -276,7 +625,7 @@ def _main_logic():
             
             cut_time = seg["end"]
             for s in reversed(context_segs):
-                clean_break = break_sentence.split("[Pause")[0].strip()
+                clean_break = _strip_pause_markers(break_sentence)
                 if clean_break and (clean_break.lower() in s["text"].lower() or s["text"].lower() in clean_break.lower()):
                     cut_time = s["end"]
                     print(f"Matched sentence at timestamp: {cut_time:.2f}s")
